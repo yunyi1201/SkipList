@@ -1,6 +1,8 @@
 use std::{
     borrow::Borrow,
-    cmp,
+    cmp, fmt,
+    fmt::Debug,
+    marker::PhantomData,
     ops::{Deref, Index},
     ptr::{self, NonNull},
 };
@@ -120,6 +122,13 @@ pub struct SkipList<K, V> {
     level: usize,
 
     level_generator: rand::rngs::ThreadRng,
+    marker: PhantomData<Box<Node<K, V>>>,
+}
+
+impl<K, V> Default for SkipList<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<K, V> SkipList<K, V> {
@@ -130,6 +139,7 @@ impl<K, V> SkipList<K, V> {
             len: 0,
             level: 1,
             level_generator: rand::rng(),
+            marker: PhantomData,
         }
     }
 
@@ -141,6 +151,15 @@ impl<K, V> SkipList<K, V> {
     /// Return the number of entries in the skip list.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    fn random_height(&mut self) -> usize {
+        let mut height = 1;
+        // Increase the height with a 50% probability.
+        while height < MAX_HEIGHT && self.level_generator.random_bool(0.5) {
+            height += 1;
+        }
+        height
     }
 }
 
@@ -185,17 +204,14 @@ where
         Q: Ord + ?Sized,
     {
         let search = self.search_position(key);
-        match search.found {
-            Some(r) => Some(Entry {
-                parent: self,
-                node: unsafe { &*r },
-            }),
-            None => None,
-        }
+        search.found.map(|node| Entry {
+            parent: self,
+            node: unsafe { &*node },
+        })
     }
 
     /// Searches for a key in the skip list and returns a list of all adjacent nodes.
-    fn search_position<'a, Q>(&self, key: &Q) -> Position<K, V>
+    fn search_position<Q>(&self, key: &Q) -> Position<K, V>
     where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -221,7 +237,7 @@ where
                 while let Some(c) = curr.as_ref() {
                     let c = c.as_ref();
                     let succ = c.tower[level as usize];
-                    match c.key.borrow().cmp(&key) {
+                    match c.key.borrow().cmp(key) {
                         cmp::Ordering::Greater => break,
                         cmp::Ordering::Equal => {
                             result.found = Some(c as *const Node<K, V> as *mut Node<K, V>)
@@ -247,16 +263,11 @@ where
     /// Insert an entry with the specified `key` and `value` into the skip list.
     ///
     /// If `replace` is `true`, then the existing entry with the same key will be removed before
-    fn insert_internal<'a>(&'a mut self, key: K, value: V, replace: bool) -> Entry<'a, K, V> {
+    fn insert_internal(&mut self, key: K, value: V, replace: bool) -> Entry<'_, K, V> {
         unsafe {
-            let search;
-            loop {
-                // First try search for the key.
-                search = self.search_position(&key);
-                let r = match search.found {
-                    Some(r) => r,
-                    None => break,
-                };
+            // First try search for the key.
+            let search = self.search_position(&key);
+            if let Some(r) = search.found {
                 if replace {
                     // If a node with the key was found and we should replace it
                     //
@@ -270,7 +281,7 @@ where
                 };
             }
             // create a new node.
-            let height = self.level_generator.random_range(1..=MAX_HEIGHT);
+            let height = self.random_height();
             let mut new_node = Box::new(Node::new(key, value, height));
 
             // set the successors of the new node.
@@ -280,7 +291,7 @@ where
                 .iter_mut()
                 .enumerate()
                 .for_each(|(i, next)| {
-                    *next = search.right[i].as_ref().map(|node| NonNull::from(node));
+                    *next = search.right[i].as_ref().map(NonNull::from);
                 });
 
             // set the predecessors of the new node.
@@ -335,18 +346,17 @@ where
                             break;
                         }
                         result = Some(c.as_ref());
-                    } else {
-                        if above_lower_bound(&bound, c.as_ref().key.borrow()) {
-                            result = Some(c.as_ref());
-                            break;
-                        }
+                    } else if above_lower_bound(&bound, c.as_ref().key.borrow()) {
+                        result = Some(c.as_ref());
+                        break;
                     }
+
                     pred = &c.as_ref().tower;
                     curr = succ;
                 }
                 level -= 1;
             }
-            return result;
+            result
         }
     }
 }
@@ -357,7 +367,7 @@ where
 {
     /// Insert a `key`-`value` pair into the skip list and return the new entry.
     /// If there is existing entry with this key, it will be replace with the new value.
-    pub fn insert<'a>(&'a mut self, key: K, value: V) -> Entry<'a, K, V> {
+    pub fn insert(&mut self, key: K, value: V) -> Entry<'_, K, V> {
         self.insert_internal(key, value, true)
     }
 }
@@ -380,6 +390,28 @@ impl<K, V> Entry<'_, K, V> {
     /// Return a reference to the value of the entry.
     pub fn value(&self) -> &V {
         &self.node.value
+    }
+}
+
+impl<'a, K, V> Clone for Entry<'a, K, V> {
+    fn clone(&self) -> Entry<'a, K, V> {
+        Entry {
+            parent: self.parent,
+            node: self.node,
+        }
+    }
+}
+
+impl<K, V> Debug for Entry<'_, K, V>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Entry")
+            .field(&self.key())
+            .field(&self.value())
+            .finish()
     }
 }
 
