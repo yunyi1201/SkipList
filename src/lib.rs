@@ -3,7 +3,7 @@ use std::{
     cmp,
     fmt::{self, Debug},
     marker::PhantomData,
-    ops::{Deref, Index},
+    ops::{Deref, Index, IndexMut},
     ptr::{self, NonNull},
 };
 
@@ -39,6 +39,15 @@ impl<K, V> Index<usize> for Tower<K, V> {
         // This implementation is actually unsafe since we don't check if the
         // index is in-bound. But this fine since this is only used internally.
         unsafe { self.pointers.get_unchecked(index) }
+    }
+}
+
+impl<K, V> IndexMut<usize> for Tower<K, V> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        // This implementation is actually unsafe since we don't check if the
+        // index is in-bound. But this fine since this is only used internally.
+        debug_assert!(index < MAX_HEIGHT);
+        unsafe { self.pointers.get_unchecked_mut(index) }
     }
 }
 
@@ -91,6 +100,9 @@ impl<K, V> Node<K, V> {
                 pointers: [None; MAX_HEIGHT],
             },
         }
+    }
+    fn height(&self) -> usize {
+        self.height
     }
 }
 
@@ -268,7 +280,8 @@ where
                     match c.key.borrow().cmp(key) {
                         cmp::Ordering::Greater => break,
                         cmp::Ordering::Equal => {
-                            result.found = Some(c as *const Node<K, V> as *mut Node<K, V>)
+                            result.found = Some(c as *const Node<K, V> as *mut Node<K, V>);
+                            break;
                         }
                         cmp::Ordering::Less => {}
                     }
@@ -392,6 +405,26 @@ where
     fn next_node(&self, pred: &Tower<K, V>) -> Option<&Node<K, V>> {
         unsafe { pred[0].as_ref().map(|node| node.as_ref()) }
     }
+
+    /// Unlink a node from the skip list.
+    fn unlink_position(&mut self, search: Position<K, V>) -> Option<(K, V)> {
+        unsafe {
+            let n = search.found?;
+            let key = ptr::read(&(*n).key);
+            let value = ptr::read(&(*n).value);
+            let n = &*n;
+
+            // Unlink the node at each level of the skip list.
+            for level in (0..n.height()).rev() {
+                let succ = n.tower[level];
+                let pred = &mut *search.left[level];
+                pred[level] = succ;
+            }
+            let _ = Box::from_raw(n as *const Node<K, V> as *mut Node<K, V>);
+            self.len -= 1;
+            Some((key, value))
+        }
+    }
 }
 
 impl<K, V> SkipList<K, V>
@@ -402,6 +435,31 @@ where
     /// If there is existing entry with this key, it will be replace with the new value.
     pub fn insert(&mut self, key: K, value: V) -> Entry<'_, K, V> {
         self.insert_internal(key, value, true)
+    }
+
+    /// Removes an entry with sepecified `key` from the skip list and return it.
+    ///
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let search = self.search_position(key);
+        self.unlink_position(search)
+    }
+
+    /// Removes an entry from the front of the skip list.
+    pub fn pop_front(&mut self) -> Option<(K, V)> {
+        let search = self.search_bound(Bound::Unbounded, false)?;
+        let search = self.search_position(search.key.borrow());
+        self.unlink_position(search)
+    }
+
+    /// Removes an entry from the back of the skip list.
+    pub fn pop_back(&mut self) -> Option<(K, V)> {
+        let search = self.search_bound(Bound::Unbounded, true)?;
+        let search = self.search_position(search.key.borrow());
+        self.unlink_position(search)
     }
 }
 
@@ -448,6 +506,53 @@ impl<'a, K, V> Clone for Entry<'a, K, V> {
             parent: self.parent,
             node: self.node,
         }
+    }
+}
+
+impl<'a, K, V> Entry<'a, K, V>
+where
+    K: Ord,
+{
+    /// Moves to the next entry in the skip list.
+    pub fn move_next(&mut self) -> bool {
+        match self.next() {
+            None => false,
+            Some(n) => {
+                *self = n;
+                true
+            }
+        }
+    }
+
+    /// Returns the next entry in the skip list.
+    pub fn next(&self) -> Option<Entry<'a, K, V>> {
+        let n = self.parent.next_node(&self.node.tower)?;
+        Some(Entry {
+            parent: self.parent,
+            node: n,
+        })
+    }
+
+    /// Moves to the previous entry in the skip list.
+    pub fn move_prev(&mut self) -> bool {
+        match self.prev() {
+            None => false,
+            Some(n) => {
+                *self = n;
+                true
+            }
+        }
+    }
+
+    /// Returns the previous entry in the skip list.
+    pub fn prev(&self) -> Option<Entry<'a, K, V>> {
+        let n = self
+            .parent
+            .search_bound(Bound::Excluded(&self.node.key), true)?;
+        Some(Entry {
+            parent: self.parent,
+            node: n,
+        })
     }
 }
 
@@ -676,9 +781,23 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let list = SkipList::<i32, i32>::new();
-        assert!(!list.contain_key(&10));
-        assert!(list.is_empty());
+        let mut s = SkipList::<i32, i32>::new();
+        assert!(!s.contain_key(&10));
+        assert!(s.is_empty());
+        s.insert(1, 10);
+        assert!(!s.is_empty());
+        s.insert(2, 20);
+        s.insert(3, 30);
+        assert!(!s.is_empty());
+
+        s.remove(&2);
+        assert!(!s.is_empty());
+
+        s.remove(&1);
+        assert!(!s.is_empty());
+
+        s.remove(&3);
+        assert!(s.is_empty());
     }
 
     #[test]
@@ -697,6 +816,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_remove() {
+        let insert = [0, 4, 2, 12, 8, 7, 11, 5];
+        let not_present = [1, 3, 6, 9, 10];
+        let remove = [2, 12, 8];
+        let remaining = [0, 4, 5, 7, 11];
+
+        let mut s = SkipList::new();
+
+        for &x in &insert {
+            s.insert(x, x * 10);
+        }
+        for x in &not_present {
+            assert!(s.remove(x).is_none());
+        }
+        for x in &remove {
+            assert!(s.remove(x).is_some());
+        }
+
+        let mut v = vec![];
+        let mut e = s.front().unwrap();
+        loop {
+            v.push(*e.key());
+            if !e.move_next() {
+                break;
+            }
+        }
+
+        assert_eq!(v, remaining);
+        for x in &insert {
+            s.remove(x);
+        }
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_entry() {
+        let mut s = SkipList::new();
+
+        assert!(s.front().is_none());
+        assert!(s.back().is_none());
+
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
+            s.insert(x, x * 10);
+        }
+
+        let mut e = s.front().unwrap();
+        assert_eq!(*e.key(), 2);
+        assert!(!e.move_prev());
+        assert!(e.move_next());
+        assert_eq!(*e.key(), 4);
+
+        e = s.back().unwrap();
+        assert_eq!(*e.key(), 12);
+        assert!(!e.move_next());
+        assert!(e.move_prev());
+        assert_eq!(*e.key(), 11);
+    }
     #[test]
     fn test_len() {
         let mut s = SkipList::new();
@@ -803,10 +980,6 @@ mod tests {
             s.iter().map(|e| *e.key()).collect::<Vec<_>>(),
             &[2, 4, 5, 7, 8, 11, 12]
         );
-
-        // let mut it = s.iter();
-
-        // assert!(it.next().is_none());
     }
 
     #[test]
