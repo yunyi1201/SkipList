@@ -1,7 +1,7 @@
 use std::{
     borrow::Borrow,
-    cmp, fmt,
-    fmt::Debug,
+    cmp,
+    fmt::{self, Debug},
     marker::PhantomData,
     ops::{Deref, Index},
     ptr::{self, NonNull},
@@ -210,6 +210,34 @@ where
         })
     }
 
+    /// Returns an interator over all entries in the skip list.
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            parent: self,
+            head: None,
+            tail: None,
+        }
+    }
+
+    pub fn range<'a, 'k, Min, Max>(
+        &'a self,
+        lower_bound: Bound<&'k Min>,
+        upper_bound: Bound<&'k Max>,
+    ) -> Range<'a, 'k, Min, Max, K, V>
+    where
+        K: Ord + Borrow<Min> + Borrow<Max>,
+        Min: Ord + ?Sized + 'k,
+        Max: Ord + ?Sized + 'k,
+    {
+        Range {
+            parent: self,
+            lower_bound,
+            upper_bound,
+            head: None,
+            tail: None,
+        }
+    }
+
     /// Searches for a key in the skip list and returns a list of all adjacent nodes.
     fn search_position<Q>(&self, key: &Q) -> Position<K, V>
     where
@@ -359,6 +387,11 @@ where
             result
         }
     }
+
+    /// Returns the successor of a node.
+    fn next_node(&self, pred: &Tower<K, V>) -> Option<&Node<K, V>> {
+        unsafe { pred[0].as_ref().map(|node| node.as_ref()) }
+    }
 }
 
 impl<K, V> SkipList<K, V>
@@ -369,6 +402,22 @@ where
     /// If there is existing entry with this key, it will be replace with the new value.
     pub fn insert(&mut self, key: K, value: V) -> Entry<'_, K, V> {
         self.insert_internal(key, value, true)
+    }
+}
+
+impl<K, V> Drop for SkipList<K, V> {
+    fn drop(&mut self) {
+        unsafe {
+            let mut curr = self.head[0];
+            while let Some(c) = curr.as_ref() {
+                let node = c.as_ref();
+                let next = node.tower[0];
+
+                let _ = Box::from_raw(c.as_ptr());
+
+                curr = next;
+            }
+        }
     }
 }
 
@@ -415,6 +464,105 @@ where
     }
 }
 
+pub struct Iter<'a, K: 'a, V: 'a> {
+    parent: &'a SkipList<K, V>,
+    head: Option<&'a Node<K, V>>,
+    tail: Option<&'a Node<K, V>>,
+}
+
+impl<'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V>
+where
+    K: Ord,
+{
+    type Item = Entry<'a, K, V>;
+    fn next(&mut self) -> Option<Entry<'a, K, V>> {
+        self.head = match self.head {
+            Some(n) => self.parent.next_node(&n.tower),
+            None => self.parent.next_node(&self.parent.head),
+        };
+        if let (Some(h), Some(t)) = (self.head, self.tail) {
+            if h.key >= t.key {
+                self.head = None;
+                self.tail = None;
+            }
+        }
+        self.head.map(|n| Entry {
+            parent: self.parent,
+            node: n,
+        })
+    }
+}
+
+impl<'a, K: 'a, V: 'a> DoubleEndedIterator for Iter<'a, K, V>
+where
+    K: Ord,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.tail = match self.tail {
+            Some(n) => self.parent.search_bound(Bound::Excluded(&n.key), true),
+            None => self.parent.search_bound(Bound::Unbounded, true),
+        };
+        if let (Some(h), Some(t)) = (self.head, self.tail) {
+            if h.key >= t.key {
+                self.head = None;
+                self.tail = None;
+            }
+        }
+        self.tail.map(|n| Entry {
+            parent: self.parent,
+            node: n,
+        })
+    }
+}
+
+/// An owning iterator over the entries of a skip list.
+pub struct IntoIter<K, V> {
+    /// All preceeding nodes have already been destroyed.
+    node: *mut Node<K, V>,
+}
+
+impl<K, V> Drop for IntoIter<K, V> {
+    fn drop(&mut self) {
+        while !self.node.is_null() {
+            unsafe {
+                //
+                let next = (*self.node).tower[0];
+
+                let _ = Box::from_raw(self.node);
+
+                self.node = match next {
+                    Some(n) => n.as_ptr(),
+                    None => ptr::null_mut(),
+                };
+            }
+        }
+    }
+}
+
+impl<K, V> Iterator for IntoIter<K, V> {
+    type Item = (K, V);
+    fn next(&mut self) -> Option<(K, V)> {
+        unsafe {
+            if self.node.is_null() {
+                return None;
+            }
+            let key = ptr::read(&(*self.node).key);
+            let value = ptr::read(&(*self.node).value);
+
+            let next = (*self.node).tower[0];
+
+            let _ = Box::from_raw(self.node);
+
+            self.node = match next {
+                Some(n) => n.as_ptr(),
+                None => ptr::null_mut(),
+            };
+
+            Some((key, value))
+        }
+    }
+}
+
 /// Helper function to check if a value is above a lower bound
 fn above_lower_bound<T: Ord + ?Sized>(bound: &Bound<&T>, other: &T) -> bool {
     match *bound {
@@ -430,6 +578,80 @@ fn below_upper_bound<T: Ord + ?Sized>(bound: &Bound<&T>, other: &T) -> bool {
         Bound::Unbounded => true,
         Bound::Included(key) => other <= key,
         Bound::Excluded(key) => other < key,
+    }
+}
+
+/// An iterator over a subset of entries of a `SkipList`.
+pub struct Range<'a, 'k, Min, Max, K: 'a, V: 'a>
+where
+    K: Ord + Borrow<Min> + Borrow<Max>,
+    Min: Ord + ?Sized + 'k,
+    Max: Ord + ?Sized + 'k,
+{
+    parent: &'a SkipList<K, V>,
+    lower_bound: Bound<&'k Min>,
+    upper_bound: Bound<&'k Max>,
+    head: Option<&'a Node<K, V>>,
+    tail: Option<&'a Node<K, V>>,
+}
+
+impl<'a, 'k, Min, Max, K, V> Iterator for Range<'a, 'k, Min, Max, K, V>
+where
+    K: Ord + Borrow<Min> + Borrow<Max>,
+    Min: Ord + ?Sized + 'k,
+    Max: Ord + ?Sized + 'k,
+{
+    type Item = Entry<'a, K, V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.head = match self.head {
+            Some(n) => self.parent.next_node(&n.tower),
+            None => self.parent.search_bound(self.lower_bound, false),
+        };
+
+        if let Some(h) = self.head {
+            let bound = match self.tail {
+                Some(t) => Bound::Excluded(t.key.borrow()),
+                None => self.upper_bound,
+            };
+            if !below_upper_bound(&bound, h.key.borrow()) {
+                self.head = None;
+                self.tail = None;
+            }
+        }
+        self.head.map(|n| Entry {
+            parent: self.parent,
+            node: n,
+        })
+    }
+}
+
+impl<'k, Min, Max, K, V> DoubleEndedIterator for Range<'_, 'k, Min, Max, K, V>
+where
+    K: Ord + Borrow<Min> + Borrow<Max>,
+    Min: Ord + ?Sized + 'k,
+    Max: Ord + ?Sized + 'k,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.tail = match self.tail {
+            Some(n) => self.parent.search_bound(Bound::Excluded(&n.key), true),
+            None => self.parent.search_bound(self.upper_bound, true),
+        };
+
+        if let Some(t) = self.tail {
+            let bound = match self.head {
+                Some(h) => Bound::Excluded(h.key.borrow()),
+                None => self.lower_bound,
+            };
+            if !above_lower_bound(&bound, t.key.borrow()) {
+                self.head = None;
+                self.tail = None;
+            }
+        }
+        self.tail.map(|n| Entry {
+            parent: self.parent,
+            node: n,
+        })
     }
 }
 
@@ -536,5 +758,283 @@ mod tests {
                 .map(|node| node.key);
             assert_eq!(node, expected);
         }
+    }
+
+    #[test]
+    fn test_front_and_back() {
+        let mut s = SkipList::new();
+        assert!(s.front().is_none());
+        assert!(s.back().is_none());
+
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
+            s.insert(x, x * 10);
+        }
+
+        assert_eq!(*s.front().unwrap().key(), 2);
+        assert_eq!(*s.back().unwrap().key(), 12);
+    }
+
+    #[test]
+    fn test_get_or_insert() {
+        let mut s = SkipList::new();
+        s.insert(3, 3);
+        s.insert(5, 5);
+        s.insert(1, 1);
+        s.insert(4, 4);
+        s.insert(2, 2);
+
+        assert_eq!(*s.get(&4).unwrap().value(), 4);
+        assert_eq!(*s.insert(4, 40).value(), 40);
+        assert_eq!(*s.get(&4).unwrap().value(), 40);
+
+        assert_eq!(*s.get_or_insert(4, 400).value(), 40);
+        assert_eq!(*s.get(&4).unwrap().value(), 40);
+        assert_eq!(*s.get_or_insert(6, 600).value(), 600);
+    }
+
+    #[test]
+    fn test_iter() {
+        let mut s = SkipList::new();
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
+            s.insert(x, x * 10);
+        }
+
+        assert_eq!(
+            s.iter().map(|e| *e.key()).collect::<Vec<_>>(),
+            &[2, 4, 5, 7, 8, 11, 12]
+        );
+
+        // let mut it = s.iter();
+
+        // assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn test_range() {
+        use Bound::*;
+        let mut s = SkipList::new();
+        let v = (0..10).map(|x| x * 10).collect::<Vec<_>>();
+        for &x in v.iter() {
+            s.insert(x, x);
+        }
+
+        assert_eq!(
+            s.iter().map(|x| *x.value()).collect::<Vec<_>>(),
+            vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+        );
+
+        assert_eq!(
+            s.iter().rev().map(|x| *x.value()).collect::<Vec<_>>(),
+            vec![90, 80, 70, 60, 50, 40, 30, 20, 10, 0]
+        );
+
+        assert_eq!(
+            s.range(Unbounded, Unbounded)
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+        );
+
+        assert_eq!(
+            s.range(Included(&0), Unbounded)
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+        );
+
+        assert_eq!(
+            s.range(Excluded(&0), Unbounded)
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90]
+        );
+
+        assert_eq!(
+            s.range(Included(&25), Unbounded)
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![30, 40, 50, 60, 70, 80, 90]
+        );
+        assert_eq!(
+            s.range(Excluded(&25), Unbounded)
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![30, 40, 50, 60, 70, 80, 90]
+        );
+        assert_eq!(
+            s.range(Included(&70), Unbounded)
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![70, 80, 90]
+        );
+
+        assert_eq!(
+            s.range(Excluded(&70), Unbounded)
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![80, 90]
+        );
+        assert_eq!(
+            s.range(Included(&100), Unbounded)
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Excluded(&100), Unbounded)
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+
+        assert_eq!(
+            s.range(Unbounded, Included(&90))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+        );
+        assert_eq!(
+            s.range(Unbounded, Excluded(&90))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![0, 10, 20, 30, 40, 50, 60, 70, 80]
+        );
+        assert_eq!(
+            s.range(Unbounded, Included(&25))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![0, 10, 20]
+        );
+        assert_eq!(
+            s.range(Unbounded, Excluded(&25))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![0, 10, 20]
+        );
+
+        assert_eq!(
+            s.range(Unbounded, Included(&70))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![0, 10, 20, 30, 40, 50, 60, 70]
+        );
+        assert_eq!(
+            s.range(Unbounded, Excluded(&70))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![0, 10, 20, 30, 40, 50, 60]
+        );
+        assert_eq!(
+            s.range(Unbounded, Included(&-1))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Unbounded, Excluded(&-1))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+
+        assert_eq!(
+            s.range(Included(&25), Included(&80))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![30, 40, 50, 60, 70, 80]
+        );
+        assert_eq!(
+            s.range(Included(&25), Excluded(&80))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![30, 40, 50, 60, 70]
+        );
+        assert_eq!(
+            s.range(Excluded(&25), Included(&80))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![30, 40, 50, 60, 70, 80]
+        );
+        assert_eq!(
+            s.range(Excluded(&25), Excluded(&80))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![30, 40, 50, 60, 70]
+        );
+
+        assert_eq!(
+            s.range(Included(&25), Included(&25))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Included(&25), Excluded(&25))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Excluded(&25), Included(&25))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Excluded(&25), Excluded(&25))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+
+        assert_eq!(
+            s.range(Included(&50), Included(&50))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![50]
+        );
+        assert_eq!(
+            s.range(Included(&50), Excluded(&50))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Excluded(&50), Included(&50))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Excluded(&50), Excluded(&50))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+
+        assert_eq!(
+            s.range(Included(&100), Included(&-2))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Included(&100), Excluded(&-2))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Excluded(&100), Included(&-2))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+        assert_eq!(
+            s.range(Excluded(&100), Excluded(&-2))
+                .map(|x| *x.value())
+                .collect::<Vec<_>>(),
+            vec![]
+        );
     }
 }
